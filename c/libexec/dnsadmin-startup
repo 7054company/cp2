@@ -1,0 +1,169 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - libexec/dnsadmin-startup                Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use cPstrict;
+
+use Cpanel::Services::Dormant ();
+use Cpanel::Services::Hot     ();
+use Cpanel::CloseFDs          ();
+use Cpanel::Rlimit            ();
+use Cpanel::Syscall           ();
+use Cpanel::Sys::Chattr       ();
+
+use Fcntl  ();
+use Socket ();
+
+use constant PID_FILE         => '/var/run/dnsadmin.pid';
+use constant DNSADMIN_SOCKET  => q{/var/cpanel/dnsadmin/sock};
+use constant DNSADMIN_LOG     => q{/usr/local/cpanel/logs/dnsadmin_log};
+use constant DNSADMIN_SOCKDIR => q{/var/cpanel/dnsadmin};
+
+=pod
+
+dnsadmin-startup is a wrapper to start dnsadmin in dormant mode if enabled
+
+=cut
+
+run(@ARGV) unless caller();
+
+sub run (@argv) {
+
+    if ( scalar @argv == 0 || called_with_option( 'help', \@argv ) ) {
+        usage();
+    }
+    elsif ( called_with_option( 'start', \@argv ) ) {
+        start( \@argv );
+    }
+    else {
+        # redirect any other calls to the dnsadmin binary itself
+        exec '/usr/local/cpanel/whostmgr/bin/dnsadmin', @argv;
+    }
+
+    exit;
+}
+
+sub usage {
+    print <<"USAGE";
+$0: start dnsadmin daemon in dormant or normal mode
+
+Options:
+    --help      this help message
+    --start     start dormant mode if enable or normal mode
+
+Any other calls are redirected to whostmgr/bin/dnsadmin.
+
+USAGE
+
+    return;
+}
+
+# do a dummy regexp here as dnsadmin use a special syntax
+sub called_with_option ( $option, $args ) {
+    return unless defined $option && ref $args;
+    return ( grep { $_ eq "--" . $option } @$args ) ? 1 : 0;
+}
+
+sub start ($argv_ar) {
+
+    # check if process is already running
+    if ( my $pid = Cpanel::Services::Hot::is_pid_file_active(PID_FILE) ) {
+        print STDERR "dnsadmin is already running. (pid $pid)\n";
+        exit(1);
+    }
+
+    Cpanel::Rlimit::set_rlimit();
+    quick_closefds();
+
+    my $dormant_mode = Cpanel::Services::Dormant->new( service => 'dnsadmin' );
+    if ( $dormant_mode->is_enabled() ) {
+        _start_dormant($argv_ar);
+    }
+    else {
+        my @args        = ('--start');
+        my $systemd_arg = _get_systemd_arg($argv_ar);
+        push( @args, $systemd_arg ) if $systemd_arg;
+        exec '/usr/local/cpanel/whostmgr/bin/dnsadmin', @args;
+    }
+
+    return;
+}
+
+sub _start_dormant ($argv_ar) {
+
+    my $systemd_arg = _get_systemd_arg($argv_ar);
+
+    # No forking when running with --systemd
+    if ( !$systemd_arg ) {
+        if ( my $pid = fork() ) {
+            exit;
+        }
+        elsif ( !defined $pid ) {
+            die "Cannot start '$0', fails to fork: $!";
+        }
+    }
+
+    # Write PID file as soon as possible.
+    Cpanel::Services::Hot::make_pid_file( PID_FILE() => $$ );
+
+    print "Starting PID $$: dnsadmin-dormant\n";
+
+    Cpanel::Syscall::syscall('setsid') unless $systemd_arg;
+    close(STDIN);
+    close(STDOUT);
+    close(STDERR);
+
+    open( STDIN, '<', '/dev/null' )                                                                 or warn "Cannot close STDING";
+    sysopen( STDERR, DNSADMIN_LOG, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_APPEND(), 0600 ) or warn "Cannot redirect STDERR";
+    open( STDOUT, ">&STDERR" )                                                                      or warn "Cannot redirect STDOUT";
+    Cpanel::Sys::Chattr::set_attribute( \*STDERR, 'APPEND' );
+
+    my $socket = _init_socket();
+    my @args   = ( '--listen=' . fileno($socket) );
+    push( @args, $systemd_arg ) if $systemd_arg;
+    exec( '/usr/local/cpanel/libexec/dnsadmin-dormant', @args )
+      or die "Cannot start libexec/dnsadmin-dormant";
+}
+
+sub _init_socket {
+
+    #Make sure that the socket directory actually exists; if /var/cpanel doesn't exist we have bigger problems and should terminate
+    if ( !-d DNSADMIN_SOCKDIR ) {
+        mkdir DNSADMIN_SOCKDIR, 0700 or die( "Could not create directory " . DNSADMIN_SOCKDIR . "!\n" );
+    }
+
+    my $socket;
+    {
+        local $^F = 1000;
+        socket( $socket, &Socket::AF_UNIX, &Socket::SOCK_STREAM, 0 );
+    }
+    my $socketfile = DNSADMIN_SOCKET;
+    unlink($socketfile);
+    my $socket_addr = Socket::sockaddr_un($socketfile);    # could consider to use Cpanel::Socket::UNIX::Micro
+    bind( $socket, $socket_addr ) || die "Could not create unix domain socket at '$socketfile': $!";
+    chown 0, 0, $socketfile;
+    chmod 0660, $socketfile;
+    listen( $socket, 45 );
+
+    return $socket;
+}
+
+sub quick_closefds {
+    open( my $nul_fh, '<', '/dev/null' ) or do { warn "Cannot open /dev/null: $!"; return };
+    if ( fileno($nul_fh) > 3 ) {
+        Cpanel::CloseFDs::fast_closefds();
+    }
+    else {
+        close($nul_fh);
+    }
+    return;
+}
+
+sub _get_systemd_arg ($argv_ar) {
+    return called_with_option( 'systemd', $argv_ar ) ? '--systemd' : ();
+}
+
+1;

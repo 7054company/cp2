@@ -1,0 +1,127 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - whostmgr/bin/perlmod                    Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+#### DEPRCATED ####
+
+use Cwd;
+use File::Spec;
+use CPAN;
+
+if ( !-e '/usr/bin/ncftpget' && -e '/usr/local/bin/ncftpget' ) {
+    system 'ln', '-s', '../local/bin/ncftpget', '/usr/bin/ncftpget';
+}
+
+chomp( my $mod = <STDIN> );
+
+system 'ln -s /usr /usr/local/ssl 2>/dev/null';
+
+my $install = @ARGV && $ARGV[0] eq '-i' ? 1 : 0;
+
+if ( $install && -x '/usr/local/cpanel/scripts/perlinstaller' ) {
+    exec '/usr/local/cpanel/scripts/perlinstaller', $mod;
+}
+
+my $homedir = ( getpwuid($>) )[7];
+
+my $protoc = 'http';
+
+# Attempt to use user's CPAN config
+if ( -e $homedir . '/.cpan/CPAN/MyConfig.pm' ) {
+    eval { require $homedir . '/.cpan/CPAN/MyConfig.pm'; };
+}
+
+if ( !-e $homedir . '/.cpan/CPAN/MyConfig.pm' || $@ ) {
+
+    # No user CPAN config exists, using system
+    eval { require CPAN::Config; };
+}
+
+{
+    no warnings 'redefine';
+
+    sub CPAN::Distribution::test {
+        my ($self) = @_;
+        $self->make;
+    }
+}
+
+require CPAN::HandleConfig;
+my @missing_config_opts = CPAN::HandleConfig::missing_config_data();
+
+if (@missing_config_opts) {
+
+    # System CPAN config doesn't exist, reset
+    $CPAN::Config = {
+        'build_cache'                  => q[10],
+        'build_dir'                    => q[/home/.cpan/build],
+        'cache_metadata'               => q[1],
+        'cpan_home'                    => q[/home/.cpan],
+        'dontload_hash'                => {},
+        'ftp'                          => q[/usr/bin/ftp],
+        'ftp_proxy'                    => q[],
+        'getcwd'                       => q[cwd],
+        'gzip'                         => q[/bin/gzip],
+        'histfile'                     => q[/home/.cpan/histfile],
+        'histsize'                     => q[100],
+        'http_proxy'                   => q[],
+        'inactivity_timeout'           => q[310],
+        'inhibit_startup_message'      => q[1],
+        'index_expire'                 => q[1],
+        'keep_source_where'            => q[/home/.cpan/sources],
+        'lynx'                         => q[],
+        'make'                         => q[/usr/bin/make],
+        'make_arg'                     => q[],
+        'make_test'                    => q[NO],
+        'make_install_arg'             => q[UNINST=1],
+        'makepl_arg'                   => q[],
+        'mbuild_arg'                   => q[],
+        'mbuild_install_arg'           => q[],
+        'mbuild_install_build_command' => q[./Build],
+        'mbuildpl_arg'                 => q[],
+        'ncftpget'                     => q[],
+        'no_proxy'                     => q[],
+        'pager'                        => q[/usr/bin/less],
+        'prefer_installer'             => q[MB],
+        'prerequisites_policy'         => q[follow],
+        'scan_cache'                   => q[atstart],
+        'shell'                        => q[/bin/bash],
+        'tar'                          => q[/bin/tar],
+        'term_is_latin'                => q[1],
+        'unzip'                        => q[/usr/bin/unzip],
+        'urllist'                      => [qq[$protoc://ftp.cpanel.net/pub/CPAN/]],
+        'wait_list'                    => [q[wait://ls6.informatik.uni-dortmund.de:1404]],
+        'wget'                         => q[/usr/bin/wget],
+    };
+
+    # Define missing options just in case
+    my @missing_config_opts = CPAN::HandleConfig::missing_config_data();
+    foreach my $opt (@missing_config_opts) {
+        $CPAN::Config->{$opt} = q[];
+    }
+}
+
+my @mods_to_get;
+push( @mods_to_get, $mod );
+for my $module (@mods_to_get) {
+    if ( @ARGV && $ARGV[0] eq '-i' ) {
+        CPAN::Shell->install($module);
+    }
+    else {
+        print qq{<br /><br /><b><font size="+3">Modules matching your query (click to install)</font></b>\n};
+        my $nummods = 0;
+        for my $mod ( CPAN::Shell->expand( 'Module', "/$mod/" ) ) {
+            $nummods++;
+            my $modname = $mod->{'ID'};
+            print qq{<font size="+2"><a href="perlmod?action=install&modname=$modname">$modname</a></font>\n};
+        }
+        if ( !$nummods ) {
+            print qq{<font size="2"><b>No Modules Match</b></font>\n};
+        }
+    }
+}
+
+print "perlmod--Install done\n";

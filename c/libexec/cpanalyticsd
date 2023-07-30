@@ -1,0 +1,110 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - libexec/cpanalyticsd                    Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+package bin::cpanalyticsd;
+
+use strict;
+use warnings;
+
+use Cpanel::Analytics         ();
+use Cpanel::Analytics::Config ();
+use Cpanel::Analytics::Daemon ();
+use Cpanel::BinCheck::Lite    ();
+use Cpanel::Services::Dormant ();
+use Cpanel::Services::Hot     ();
+use Cpanel::Sys::Setsid       ();
+use IO::Select                ();
+
+##
+## global constants
+##
+
+my $SOFT_QUEUE_LIMIT = 1024 * 64;      # 64 KiB of in-memory storage (estimate: should hold several thousand records)
+my $HARD_QUEUE_LIMIT = 1024 * 1024;    # 1 MiB hard limit when we can't flush fast enough to keep up
+
+my $SELECT_TIMEOUT = 2;                # This should be fairly low so that the queue will still be flushed promptly even if packets stop coming in
+my $VERBOSE        = 1;
+
+my $MAX_READ = 16384;
+
+##
+## signal handlers
+##
+
+local $SIG{PIPE} = 'ignore';
+
+##
+## global variables
+##
+my $error_log_fh;
+
+##
+## run
+##
+
+exit startup(@ARGV) unless caller;
+
+sub startup {
+    my @args = @_;
+
+    Cpanel::BinCheck::Lite::check_argv(@args);
+
+    my ( $listenfd, $acceptedfd ) = _parse_argv( \@args );
+
+    Cpanel::Analytics::prerequisites() unless $acceptedfd;
+
+    if ( $args[0] eq '--start' ) {
+        if ( !$acceptedfd && Cpanel::Services::Dormant->new( service => 'cpanalyticsd' )->is_enabled() ) {
+            exec '/usr/local/cpanel/libexec/cpanalyticsd-dormant';
+            die "exec: $!";
+        }
+
+        Cpanel::Sys::Setsid::full_daemonize() if !$listenfd;
+        return Cpanel::Analytics::Daemon->new()->start_daemon( $listenfd, $acceptedfd );
+    }
+    elsif ( $args[0] eq '--debug' ) {
+        return Cpanel::Analytics::Daemon->new( { debug => 1 } )->start_daemon( $listenfd, $acceptedfd );
+    }
+    elsif ( @args == 1 && $args[0] eq '--stop' ) {
+        if ( my $pid = Cpanel::Services::Hot::is_pid_file_active( Cpanel::Analytics::Config::ANALYTICS_PID_FILE() ) ) {
+            kill 'TERM', $pid;
+        }
+    }
+    else {
+        _die_usage();
+    }
+
+    return 0;
+}
+
+sub _die_usage {
+    die <<EOU;
+usage: $0 <--start|--stop|--debug>
+
+--start: Start the daemon
+
+--stop: Stop the daemon
+
+--debug: Run the daemon in the foreground, and enable verbose output
+EOU
+}
+
+sub _parse_argv {
+    my $argv_ref = shift;
+    my ( $listenfd, $accepted );
+    foreach my $arg ( @{$argv_ref} ) {
+        if ( $arg =~ /--listen=(\S+)/ ) {
+            $listenfd = $1;
+        }
+        elsif ( $arg =~ /--accepted=(\S+)/ ) {
+            $accepted = $1;
+        }
+    }
+    return $listenfd, $accepted;
+}
+
+1;

@@ -1,0 +1,28 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - whostmgr/bin/setupipaliases             Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+package whostmgr::bin::setupipaliases;
+
+use strict;
+use warnings;
+
+use Cpanel::Init::Simple ();
+
+exit( run() || 0 ) unless caller;
+
+sub run {
+    return 0 if -e '/etc/ipaliasesdisable';
+    return convert_ips_and_enable_ipaliases();
+}
+
+sub convert_ips_and_enable_ipaliases {
+    if ( !-e '/etc/ips' ) {
+        system('/usr/local/cpanel/whostmgr/bin/convertips');
+    }
+
+    return Cpanel::Init::Simple::call_cpservice_with( 'ipaliases' => qw/install enable/ );
+}

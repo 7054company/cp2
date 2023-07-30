@@ -1,0 +1,158 @@
+#! /usr/local/cpanel/3rdparty/bin/perl
+### BEGIN INIT INFO
+# Provides: cpipv6
+# Required-Start: $network
+# Defalt-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Description: Binding IPv6 addresses
+### END INIT INFO
+# chkconfig: 2345 11 91
+
+# cpanel - whostmgr/bin/cpipv6                       Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use strict;
+## no critic qw(TestingAndDebugging::RequireUseWarnings) - not vetted for warnings.
+
+use Cpanel::Config::LoadWwwAcctConf ();
+use Cpanel::Locale                  ();
+use Cpanel::Validate::IP::Expand    ();
+use Cpanel::IPv6::Utils             ();
+use Cpanel::IPv6::User              ();
+use Cpanel::SafeRun::Object         ();
+use Cpanel::CPAN::Net::IP           ();
+use Cpanel::IPv6::Has               ();
+
+my $locale = Cpanel::Locale->get_handle();
+
+# sanity checking #
+die $locale->maketext('IPv6 is not configured on the system.') . "\n"
+  if !Cpanel::IPv6::Has::system_has_ipv6();
+
+# we need the ethernet device to work with #
+my $wwwacct_ref = Cpanel::Config::LoadWwwAcctConf::loadwwwacctconf();
+my $ethdev      = $wwwacct_ref->{'ETHDEV'} || 'eth0';
+warn $locale->maketext( 'The [asis,ETHDEV] setting is not configured in the [asis,/etc/wwwacct.conf] file. The system will use [_1] as the [asis,ETHDEV] value.', $ethdev ) . "\n"
+  if !$wwwacct_ref->{'ETHDEV'};
+
+# load the ips #
+my ( $ips, $addrlabels ) = _ipaddr_strategy();
+exit if !$ips || !$addrlabels;
+
+# See how we were called.
+if ( grep { /start|reload/ } @ARGV ) {
+
+    # if this is a restart, stop first #
+    system $0, 'stop' if @{ _bound_ips() } && grep { /restart|reload/ } @ARGV;
+
+    # apply all the IPs #
+    foreach my $ip ( @{$ips} ) {
+        my $ret = eval { Cpanel::SafeRun::Object->new_or_die( 'program' => 'ip', 'args' => [ qw{ addr add }, @{$ip} ] ); 1 };
+        print STDERR $locale->maketext( 'The system failed to apply the IP address [_1]: [_2]', $ip->[-1], $@->to_string() ) . "\n" if !$ret;
+    }
+
+    # now addrlabels #
+    foreach my $addrlabel ( @{$addrlabels} ) {
+        my $ret = eval { Cpanel::SafeRun::Object->new_or_die( 'program' => 'ip', 'args' => [ qw{ addrlabel add }, @{$addrlabel} ] ); 1 };
+        print STDERR $locale->maketext( 'The system failed to apply the IP address label [_1]: [_2]', $addrlabel->[-1], $@->to_string() ) . "\n" if !$ret;
+    }
+}
+elsif ( grep { /stop/ } @ARGV ) {
+
+    # remove the addrlabels #
+    foreach my $addrlabel ( @{$addrlabels} ) {
+        my $ret = eval { Cpanel::SafeRun::Object->new_or_die( 'program' => 'ip', 'args' => [ qw{ addrlabel del }, @{$addrlabel} ] ); 1 };
+        print STDERR $locale->maketext( 'The system failed to remove the IP address label [_1]: [_2]', $addrlabel->[-1], $@->to_string() ) . "\n" if !$ret;
+    }
+
+    # remove all the IPs #
+    foreach my $ip ( @{$ips} ) {
+        my $ret = eval { Cpanel::SafeRun::Object->new_or_die( 'program' => 'ip', 'args' => [ qw{ addr del }, @{$ip} ] ); 1 };
+        print STDERR $locale->maketext( 'The system failed to remove the IP address [_1]: [_2]', $ip->[-1], $@->to_string() ) . "\n" if !$ret;
+    }
+}
+elsif ( grep { /status/ } @ARGV ) {
+
+    # a a status report of what IPs are bound, if any; this output is parsed by Cpanel::ServiceManager::Service::Cpipv6  #
+    my $ip_status   = _bound_ips();
+    my $total_count = @{$ip_status};
+    my $bound_count = grep { $_->{'bound'} } @{$ip_status};
+    if ($bound_count) {
+
+        # we report how many IPs are bound and how many are expected #
+        print $locale->maketext( '[_1] of [_2] user IPv6 addresses are bound.', $bound_count, $total_count ) . "\n";
+    }
+    elsif ( !$total_count ) {
+
+        # we report that there are no users with bound addresses required #
+        print $locale->maketext('No users have assigned IPv6 addresses.') . "\n";
+    }
+    else {
+        print $locale->maketext( 'No bound user IP addresses exist on the system! The system should have [_1] bound IP addresses.', $total_count ) . "\n";
+    }
+}
+elsif ( grep { /list/ } @ARGV ) {
+
+    # list all the ips that should be bound and their status #
+    my $ip_status = _bound_ips();
+    print "User IPv6 addresses:\n";
+    foreach my $ip ( @{$ip_status} ) {
+        my $status = $ip->{'bound'} ? 'bound' : 'unbound!';
+        print "$ip->{'ip'} is $status\n";
+    }
+}
+else {
+    print "Usage: $0 {start|stop|restart|status|list}\n";
+}
+
+sub _ipaddr_strategy {
+
+    # load the range configuration, we'll enable each user #
+    my ( $ret, $range_data_ref ) = Cpanel::IPv6::Utils::load_range_config();
+    return ( undef, undef ) if !$ret;
+
+    my ( @ips, @addrlabels );
+
+    foreach my $range ( keys %{$range_data_ref} ) {
+        my $range_ref = $range_data_ref->{$range};
+
+        # don't process the shared IP address, its managed externally #
+        next if $range eq Cpanel::IPv6::Utils::shared_ipv6_key();
+
+        # we'll need to compute this range's prefix, if we cannot, move on #
+        my $ip_range = Cpanel::CPAN::Net::IP->new( $range_ref->{'first'} . ' - ' . $range_ref->{'last'} );
+        next if !$ip_range || !$ip_range->prefixlen();
+
+        # skip this range if there's no users in it #
+        next if !@{ $range_data_ref->{$range}->{'range_users'} };
+
+        # compute the address label for this range; it applies to all users in this range #
+        push @addrlabels, [ 'prefix', "$range_ref->{'first'}/" . $ip_range->prefixlen(), 'label', '99' ];
+
+        # and finally load and get the ip for each user #
+        foreach my $user ( @{ $range_data_ref->{$range}->{'range_users'} } ) {
+            my ( $ret, $ip ) = Cpanel::IPv6::User::get_user_ipv6_address($user);
+            next if !$ret;
+            push @ips, [ 'dev', $ethdev, "$ip/" . $ip_range->prefixlen() ];
+        }
+    }
+
+    return \@ips, \@addrlabels;
+}
+
+sub _bound_ips {
+
+    # return how many IPs are bound #
+    my $bound_ips = Cpanel::SafeRun::Object->new_or_die( 'program' => 'ip', 'args' => [ qw{ -6 addr show dev }, $ethdev ] )->stdout();
+    my @ip_status;
+    foreach my $ip ( @{$ips} ) {
+        my ( $ip_address, $prefix ) = split( '/', $ip->[-1] );
+        my $ip_compressed = Cpanel::Validate::IP::Expand::normalize_ipv6($ip_address);
+        $ip_compressed .= "/$prefix" if $prefix;
+        my $bound = $bound_ips =~ m/\b\Q$ip_compressed\E\b/ ? 1 : 0;
+        push @ip_status, { 'bound' => $bound, 'ip' => $ip_compressed };
+    }
+    return \@ip_status;
+}

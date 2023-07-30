@@ -1,0 +1,49 @@
+#!/bin/bash
+#
+# filelimits       Increase filesystem limits
+#
+# chkconfig: 2345 11 91
+# description: Increases max open file limits
+# probe: false
+
+# Source function library.
+if [ -f /etc/init.d/functions ]; then
+  . /etc/init.d/functions
+elif [ -f /etc/init.d/functions ]; then
+  . /etc/init.d/functions
+else
+  echo "Could not find functions file, your system may be broken"
+  exit 1
+fi
+
+
+# See how we were called.
+case "$1" in
+  start)
+        if [ -e "/usr/local/cpanel/scripts/increase_filesystem_limits" ]; then
+		    action "Increasing file system limits (v2)" /bin/true
+            /usr/local/cpanel/scripts/increase_filesystem_limits
+        else
+		    action "Increasing file system limits" /bin/true
+            echo 131072 > /proc/sys/fs/file-max
+		    if [ -e "/proc/sys/fs/dquot-max" ]; then
+			    echo 16384 > /proc/sys/fs/dquot-max
+		    fi
+        fi
+        ;;
+  stop)
+        ;;
+  restart)
+	$0 stop
+	$0 start
+	;;
+  reload)
+	$0 restart
+	;;
+  *)
+        echo "Usage: filelimits {start|stop|restart|reload}"
+        exit 1
+esac
+
+exit 0
+

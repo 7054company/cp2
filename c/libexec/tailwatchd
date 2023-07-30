@@ -1,0 +1,140 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - libexec/tailwatchd                      Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+# these work fine, lower memory if not in use...
+# use strict;
+# use warnings;
+require Cpanel::Rlimit;
+require Cpanel::Env;
+use Cpanel::TailWatch   ();
+use Getopt::Param::Tiny ();
+
+Cpanel::Env::set_safe_path();
+Cpanel::Env::clean_env( 'http_purge' => 1 );
+umask(0022);
+
+my $param = Getopt::Param::Tiny->new();
+my $tail;
+if ( $param->param('version') ) {
+    $tail ||= get_tail_obj( $param, $Cpanel::TailWatch::TAILWATCH_OBJECT_TINY );
+    require Cpanel::TailWatch::Utils::Version;    # PPI USE OK - version
+    $tail->version( $param->param('version') eq 'long' );
+}
+elsif ( $param->param('status') ) {
+    $tail ||= get_tail_obj( $param, $Cpanel::TailWatch::TAILWATCH_OBJECT_FULL );
+    require Cpanel::TailWatch::Utils::Status;     # PPI USE OK - status
+    $tail->status();
+}
+elsif ( $param->param('enable') || $param->param('disable') ) {
+    $tail ||= get_tail_obj( $param, $Cpanel::TailWatch::TAILWATCH_OBJECT_TINY );
+    require Cpanel::TailWatch::Utils::EnableDisable;    # PPI USE OK - enable_disable_drivers
+    $tail->enable_disable_drivers();
+}
+elsif ( $param->param('stop') ) {
+    $tail ||= get_tail_obj( $param, $Cpanel::TailWatch::TAILWATCH_OBJECT_EMPTY );
+    require Cpanel::TailWatch::Utils::Stop;             # PPI USE OK - stop
+    $tail->stop();
+}
+elsif ( $param->param('start') ) {
+    start_tailwatchd();
+}
+elsif ( $param->param('restart') ) {
+    $tail ||= get_tail_obj( $param, $Cpanel::TailWatch::TAILWATCH_OBJECT_EMPTY );
+    require Cpanel::TailWatch::Utils::Stop;             # PPI USE OK - stop
+    if ( $tail->stop() ) {
+        start_tailwatchd();
+    }
+    exit 1;
+}
+elsif ( $param->param('perldoc') ) {
+    exec qw(perldoc /usr/local/cpanel/Cpanel/TailWatch.pm);
+}
+else {
+    print <<"END_HELP";
+$0 - Driver based real time log processing
+   --help          This screen
+   --version       Show version of Cpanel::TailWatch
+   --version=long  Same as --version but also include active driver modules version information also.
+   --status        Status information
+   --stop          Stop current tailwatch daemon
+   --start         Start tailwatch daemon
+   --systemd       Run in foreground and notify systemd of startup, shutdown, and reloading
+   --restart       Start tailwatch daemon, stopping it first if necessary
+
+   --max-fd=n      Maximum amount of files to keep open at a time (default is 100 or whatever is configured in 'tailwatchd_max_fd' in cpconf)
+                   once the limit is reached files that were added via the internal "dynamic" file lookup will not stay open between passes.
+
+   --trace         log the first 10,000 lines the drivers collectively process
+   --trace=n       log the first 'n' lines the drivers collectively process
+       Trace only takes effect on --[re]start.
+       --start --trace (equivalent to --start --trace=10000)
+       --restart --trace=`perl -e 'print 12+3-4+5+67+8+9;'`
+       --start --trace=1729
+       --status --trace (--trace has no effect here)
+
+   --debug         This tells all driver's to log() debug messages.
+       Debug only takes effect in --[re]start.
+       Typically the message should be prefaced with '[debug]' and
+       are about processed lines that result in an entry of some sort
+
+   --perldoc       This shows the POD for Cpanel::TailWatch
+
+   --enable and --disable
+      Enables or disables the given drivers. Drivers must be the full name space as reported by --status and are case sensitive.
+
+      Unknown (E.g. non existant, broken, mis-spelled, etc) NS's are ignored.
+         --enable=Cpanel::TailWatch::Oops
+
+      Ungiven one's are unaffected.
+         --enable=Cpanel::TailWatch::cPBandwd  = only enables cpbandwd driver, other are left alone.
+
+      Multiple one's can be given:
+        --enable=Cpanel::TailWatch::cPBandwd --enable=Cpanel::TailWatch::RecentAuthedMailIpTracker --disable=Cpanel::TailWatch::Eximstats
+
+      --enable take precedence if a driver is passed to --enable and --disable
+         --enable=Cpanel::TailWatch::cPBandwd --disable=Cpanel::TailWatch::cPBandwd = enables cpbandwd driver
+
+      Hint: If these flags change the current state (IE enable something that was disabled and vice versa) tailwatchd will be restarted, to avoid that pass it --restart=0
+      Hint: By default, only errors are output and everything is logged. To see details of what is happening use --verbose
+
+END_HELP
+}
+
+sub start_tailwatchd {
+    _exit_if_tailwatchd_already_running();
+
+    # Cpanel::TailWatch will daemonize
+    Cpanel::Rlimit::set_rlimit_to_infinity();
+    exec '/usr/local/cpanel/libexec/tailwatch/tailwatchd', @ARGV;
+    exit 1;    # unreached
+}
+
+sub get_tail_obj {
+    my $param    = shift;
+    my $type     = shift;
+    my $tail_obj = Cpanel::TailWatch->new( { 'param_obj' => $param, 'type' => $type } );
+    return $tail_obj;
+}
+
+sub _exit_if_tailwatchd_already_running {
+    require Cpanel::Services;
+
+    my %running_instances = Cpanel::Services::get_running_process_info(
+        'service' => 'tailwatchd',
+        'user'    => 'root',
+    );
+
+    if ( exists $running_instances{'tailwatchd'} ) {
+        my $pid  = $running_instances{'tailwatchd'}->{'pid'};
+        my $user = $running_instances{'tailwatchd'}->{'user'};
+        my $cmd  = $running_instances{'tailwatchd'}->{'command'};
+        print "tailwatchd is already running ($cmd) with PID $pid by $user\n";
+        exit 1;
+    }
+
+    return 1;
+}

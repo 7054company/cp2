@@ -1,0 +1,270 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - whostmgr/bin/dnsqueue                   Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use strict;
+use Cpanel::SafeFile           ();
+use Cpanel::SafeRun::InOut     ();
+use Cpanel::Config::LoadCpConf ();
+use Cpanel::Logger             ();
+use Cpanel::PID                ();
+use Cpanel::StringFunc::Match  ();
+use Cpanel::Hostname           ();
+use Cpanel::Encoder::URI       ();
+use Cpanel::DNSLib::PeerConfig ();
+
+if ( $ARGV[0] eq "--bincheck" ) {
+    print "BinCheck ok\n";
+    exit 0;
+}
+
+my $logger = Cpanel::Logger->new();
+
+our $MAX_LOG_SEND_SIZE = 1024 * 128;    # Maximum amount of log to send see case 194133
+
+$| = 1;
+
+# Uncomment: For testing notifications (until we convert to a modulino)
+
+#{
+#    sub test_notify {
+#        my $failed_hosts = { "pig.org-broken-" . rand() => 'dead', "frog.org-broken-" . rand() => 'dsd' };
+#        local *_get_down_hosts_from_host_failures = sub { return keys %{$failed_hosts} };
+#        _send_notification_of_down_peers($failed_hosts);
+#        $failed_hosts = { "one.org-broken-" . rand() => 'dead' };
+#        _send_notification_of_down_peers($failed_hosts);
+#        exit();
+#
+#    }
+#    test_notify();
+#}
+
+# If clustering is disabled there is no point in attempting to run the queue
+# The only commands that get queued are remote ones at present
+exit 1 unless -e '/var/cpanel/useclusteringdns';
+
+# Check that we don't have multiple instances of the queue runner executing
+my $pid_obj = Cpanel::PID->new( { 'pid_file' => '/var/run/cpanel-dnsqueue.pid' } );
+exit 0 unless ( $pid_obj->create_pid_file() > 0 );
+
+my $now    = time();
+my $cpconf = Cpanel::Config::LoadCpConf::loadcpconf();
+
+my %host_failures = ();
+
+opendir( RETRIES, "/var/cpanel/clusterqueue/retry" );
+my @RETRIES = grep { !/^\./ } readdir(RETRIES);
+closedir(RETRIES);
+
+foreach my $retry ( sort @RETRIES ) {
+    my $queuetime = $now;
+    my $dnsuniqid = $retry;
+    if ( $retry =~ /^(\d+)-(\w+)$/ && length($2) >= 32 ) {
+        $queuetime = $1;
+        $dnsuniqid = $2;
+    }
+
+    next if ( $retry =~ /\.lock$/ );
+
+    my @HOSTS;
+    my ($request);
+
+    if ( isdaysold( $queuetime, 14 ) ) {
+        unlink( "/var/cpanel/clusterqueue/retry/${retry}", "/var/cpanel/clusterqueue/requests/${retry}" );
+        next();
+    }
+
+    my $qlock = Cpanel::SafeFile::safeopen( \*CREQ, "/var/cpanel/clusterqueue/retry/${retry}" );
+    if ( !$qlock ) {
+        $logger->warn("Could not read from /var/cpanel/clusterqueue/retry/${retry}");
+        next;
+    }
+    while (<CREQ>) {
+        chomp();
+        push( @HOSTS, $_ );
+    }
+
+    # Check to see if any hosts are valid:
+    # Always valid when not disabled.
+    # If it's disabled we'll force 5 attempts before giving up.
+    my $valid_request = 0;
+    my $forced_hosts  = '';
+    my %check_hosts   = ();
+    foreach my $host (@HOSTS) {
+        if ( -e '/var/cpanel/clusterqueue/status/' . $host . '-down' ) {
+            if ( !defined $host_failures{$host} || $host_failures{$host} < 5 ) {
+                $forced_hosts .= $host . ',';
+                $check_hosts{$host} = 1;
+                $valid_request = 1;
+            }
+        }
+        else {
+            $valid_request = 1;
+        }
+    }
+    unless ($valid_request) {
+        Cpanel::SafeFile::safeclose( \*CREQ, $qlock );
+        next;
+    }
+
+    open( my $req_fh, '<', "/var/cpanel/clusterqueue/requests/${retry}" );
+    {
+        local $/;
+        $request .= readline($req_fh);
+    }
+    close($req_fh);
+    chomp($request);
+
+    my $hosts = join( ",", @HOSTS );
+
+    my ($action);
+    ( $action, $request ) = split( /\n/, $request );
+    $request =~ s/\&(?:hosts|dnsqueuetime|dnsuniqid)=[^&]+//g;
+    $request =~ s/^(?:hosts|dnsqueuetime|dnsuniqid)=[^&]+(\&|$)//g;
+    $request .= ( $request ? '&' : '' ) . "hosts=${hosts}&dnsqueuetime=${queuetime}&dnsuniqid=${dnsuniqid}";
+
+    if ($forced_hosts) {
+        $forced_hosts =~ s/,$//;
+        $request .= '&ignore_downed_hosts=' . $forced_hosts;
+    }
+
+    Cpanel::SafeFile::safeclose( \*CREQ, $qlock );
+
+    unlink("/var/cpanel/clusterqueue/retry/${retry}");
+    unlink("/var/cpanel/clusterqueue/requests/${retry}");
+    my @CALL;
+    if ( exists $cpconf->{'dnsadminapp'} && $cpconf->{'dnsadminapp'} ne '' && substr( $cpconf->{'dnsadminapp'}, 0, 1 ) eq '/' && -x $cpconf->{'dnsadminapp'} ) {
+        push @CALL, $cpconf->{'dnsadminapp'};
+    }
+    else {
+        push @CALL, '/usr/local/cpanel/whostmgr/bin/dnsadmin';
+        if ( defined $CALL[$#CALL] && -e $CALL[$#CALL] . '-ssl' ) {
+            $CALL[$#CALL] .= '-ssl';
+        }
+    }
+
+    if ( Cpanel::SafeRun::InOut::inout( \*DNSWRITE, \*DNSREAD, @CALL ) ) {
+        print DNSWRITE "$action\n$request";
+        close(DNSWRITE);
+        {
+            local $/;
+            print readline(DNSREAD);
+        }
+        close(DNSREAD);
+    }
+
+    # Evaluate success of forced retries
+    foreach my $host ( keys %check_hosts ) {
+        my $hlog_lock = Cpanel::SafeFile::safeopen( \*HLOG, '<', '/var/cpanel/clusterqueue/status/' . $host );
+        if ( !$hlog_lock ) {
+            $logger->warn("Could not read from /var/cpanel/clusterqueue/status/$host");
+            next;
+        }
+        my $status = <HLOG> || '';
+        Cpanel::SafeFile::safeclose( \*HLOG, $hlog_lock );
+        chomp $status;
+        if ( Cpanel::StringFunc::Match::endmatch( $status, '1' ) ) {
+            unlink '/var/cpanel/clusterqueue/status/' . $host . '-down';
+        }
+        else {
+            $host_failures{$host} ||= 0;
+            $host_failures{$host} += 1;
+        }
+    }
+
+}
+
+# Send notification about cluster members that are still unreachable
+if ( !exists $cpconf->{'cluster_failure_notifications'} || $cpconf->{'cluster_failure_notifications'} eq '1' ) {
+    _send_notification_of_down_peers( \%host_failures );
+}
+
+$pid_obj->remove_pid_file();
+exit 0;
+
+sub _send_notification_of_down_peers {
+    my ($host_failures_ref) = @_;
+
+    if ( my @down_hosts = _get_down_hosts_from_host_failures($host_failures_ref) ) {
+        my $hostname = Cpanel::Hostname::gethostname();
+        require Cpanel::Redirect;
+        my $url_host        = Cpanel::Redirect::getserviceSSLdomain('cpanel') || $hostname;
+        my $host_events_ref = _get_failure_events_for_hosts( \@down_hosts );
+
+        require Cpanel::IP::Remote;
+        require Cpanel::Notify;
+        Cpanel::Notify::notification_class(
+            'class'            => 'DnsAdmin::UnreachablePeer',
+            'application'      => 'dnsadmin-' . join( '-', sort @down_hosts ),
+            'status'           => 'failed',
+            'interval'         => 3600,
+            'priority'         => 1,
+            'constructor_args' => [
+                'down_hosts'        => \@down_hosts,
+                'host_events'       => $host_events_ref,
+                'url_host'          => $url_host,
+                'origin'            => 'dnsadmin',
+                'source_ip_address' => Cpanel::IP::Remote::get_current_remote_ip(),
+                'attach_files'      => [ map { { 'name' => "$_-failures-log.txt", 'content' => \join( "\n", @{ $host_events_ref->{$_} } ) } } keys %{$host_events_ref} ],
+            ],
+        );
+    }
+}
+
+sub _get_down_hosts_from_host_failures {
+    my ($host_failures_ref) = @_;
+
+    my @down_hosts;
+    if ( scalar keys %{$host_failures_ref} ) {
+
+        # Dont send warnings about cluster members that are disabled.  The queue for these systems will expire
+        # over time or be cleared when they are reenabled
+        my %peerlist = map { $_ => 1 } Cpanel::DNSLib::PeerConfig::getdnspeers();
+
+        foreach my $host ( sort keys %{$host_failures_ref} ) {
+            if ( $peerlist{$host} && -e '/var/cpanel/clusterqueue/status/' . $host . '-down' ) {
+                push @down_hosts, $host;
+            }
+        }
+    }
+    return @down_hosts;
+}
+
+sub _get_failure_events_for_hosts {
+    my ($down_hosts_ref) = @_;
+
+    my %host_events;
+    foreach my $host ( @{$down_hosts_ref} ) {
+        $host_events{$host} = [];
+        my $failure_log_file = '/var/cpanel/clusterqueue/status/' . $host . '-failure_log';
+        if ( open( my $fail_log_fh, '<', $failure_log_file ) ) {
+            my $log_size = ( stat($fail_log_fh) )[7];
+            if ( $log_size > $MAX_LOG_SEND_SIZE ) {    # truncate the message to avoid huge log files - see case 194133
+                my $log_start_position = $log_size - $MAX_LOG_SEND_SIZE;
+                seek( $fail_log_fh, $log_start_position, 0 );
+                readline($fail_log_fh);                # discard partial line
+                push @{ $host_events{$host} }, '--- TRUNCATED ---';
+            }
+            while ( readline($fail_log_fh) ) {
+                chomp();
+                my $event = Cpanel::Encoder::URI::uri_decode_str($_);
+                push @{ $host_events{$host} }, $event;
+            }
+            close($fail_log_fh);
+        }
+    }
+    return \%host_events;
+}
+
+sub isdaysold {
+    my ( $mtime, $days ) = @_;
+
+    if ( ( $mtime + ( $days * 86400 ) ) < $now ) {
+        return (1);
+    }
+
+    return (0);
+}

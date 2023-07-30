@@ -1,0 +1,333 @@
+#!/bin/bash
+### BEGIN INIT INFO
+# Provides: ipalises
+# Required-Start: $network
+# Defalt-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Description: Activates/Deactivates all ip aliases
+### END INIT INFO
+#
+# ipaliases       Bring up/down ipaliases
+# chkconfig: 2345 11 91
+#
+
+success() {
+    echo -en "\\033[60G[\\033[1;32m  OK  \\033[0;39m]\r"
+    return 0
+}
+
+failure() {
+    local rc=$?
+    echo -en "\\033[60G[\\033[1;31mFAILED\\033[0;39m]\r"
+    [ -x /bin/plymouth ] && /bin/plymouth --details
+    return $rc
+}
+
+action() {
+    local STRING=$1
+    echo -n "$STRING "
+    shift
+    "$@" && success $"$STRING" || failure $"$STRING"
+    local rc=$?
+    echo
+    return $rc
+}
+
+if [ ! -f /etc/ips ]; then
+    exit 0
+fi
+
+[ -x /sbin/ip ] || exit 0
+
+#
+# Function calculates number of bit in a netmask
+#
+mask2cidr() {
+    nbits=0
+    IFS=.
+    for dec in $1 ; do
+        case $dec in
+            255) let nbits+=8;;
+            254) let nbits+=7;;
+            252) let nbits+=6;;
+            248) let nbits+=5;;
+            240) let nbits+=4;;
+            224) let nbits+=3;;
+            192) let nbits+=2;;
+            128) let nbits+=1;;
+            0);;
+            *) echo "Error: $dec is not a valid netmask value" >&2;;
+        esac
+    done
+    echo "$nbits"
+}
+
+#
+# Create a bitmask based on the number of bits in the CIDR
+#
+cidr2mask() {
+	local i mask=""
+	local full_octets=$(($1/8))
+	local partial_octet=$(($1%8))
+
+	for ((i=0;i<4;i+=1)); do
+		if [ $i -lt $full_octets ]; then
+		    mask+=255
+		elif [ $i -eq $full_octets ]; then
+		    mask+=$((256 - 2**(8-$partial_octet)))
+		else
+		    mask+=0
+		fi
+		test $i -lt 3 && mask+=.
+	done
+
+	echo $mask
+}
+
+ETHDEV=`grep ETHDEV /etc/wwwacct.conf | awk '{print $2}'`
+defaultmask="255.255.255.0"
+mainip=`grep -o -E '([0-9]{1,3}\.){3}[0-9]{1,3}' /var/cpanel/mainip | head -n1`
+
+# Don't break an existing network config if the main IP isn't known:
+if [ -z "$mainip" ]; then
+	echo 'Could not find an IP address in /var/cpanel/mainip; network configuration will not be changed. Consider running /usr/local/cpanel/scripts/mainipcheck first to correct this.'
+	exit 1
+fi
+
+if [ "$ETHDEV" = "" ]; then
+	ETHDEV=eth0
+fi
+if [ "$ETHDEV" = " " ]; then
+	ETHDEV=eth0
+fi
+
+# See how we were called.
+case "$1" in
+  start)
+	# Compile two lists: interfaces that already exist, and interfaces that must be created
+	exists=''
+	create=''
+	ifcfg=`/sbin/ip -4 addr show | grep -E "inet[^0-9]"`
+	for ip in `cat /etc/ips | grep -E -v "\\b$mainip\\b"`; do
+		broadcast=`echo $ip | awk -F: '{ print $3 }'`
+		netmask=`echo $ip | awk -F: '{ print $2 }'`
+		ip=`echo $ip | awk -F: '{ print $1 }'`
+		if [ "$netmask" = "" ]; then
+			netmask=$defaultmask
+			broadcast=`echo $ip | awk -F. '{ print $1"."$2"."$3".255" }'`
+		fi
+		if [ "$netmask" = "255.255.255.0" ]; then
+			broadcast=`echo $ip | awk -F. '{ print $1"."$2"."$3".255" }'`
+		fi
+		found=`echo "$ifcfg" | awk '{intf=$NF} /[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/ {print intf $0}' | grep -E "inet[^0-9]+$ip\\b"`
+		if [ "$found" != "" ]; then
+			intf=`echo $found | awk '{print $1}'`
+			exists="$exists $intf,$ip,$netmask,$broadcast"
+		else
+			create="$create $ip,$netmask,$broadcast"
+		fi
+	done
+
+	if [ "$exists" != "" ]; then
+		# Compile two lists: interfaces with the correct mask, and interfaces whose masks have changed
+		# If any interfaces have to be taken down, we may need to rebuild them *all*,
+		# since deleting a primary interface deletes all its secondary interfaces as well
+		masksame=''
+		maskdiff=''
+		for ex in $exists ; do
+			broadcast=`echo $ex | awk -F, '{ print $4 }'`
+			netmask=`echo $ex | awk -F, '{ print $3 }'`
+			ip=`echo $ex | awk -F, '{ print $2 }'`
+			intf=`echo $ex | awk -F, '{ print $1 }'`
+			cidr=$(mask2cidr $netmask)
+			ipfull="$ip/$cidr"
+			match=`/sbin/ip -4 addr show | grep -E "inet[^0-9]+$ipfull\\b"`
+			if [ "$match" != "" ]; then
+				masksame="$masksame $ex"
+			else
+				maskdiff="$ex $maskdiff"
+				echo "Address $ip is already configured on $intf, but mask has changed to $netmask"
+				# Verify that it's still up before trying to take it down;
+				# Suppresses an error msg if it's a secondary interface that got nuked when we deleted a primary
+				found=`/sbin/ip -4 addr show dev $intf | grep -E "inet[^0-9]+$ip\\b"`
+				if [ "$found" != "" ]; then
+					ipfull=`echo $found | awk '{print $2}'`
+					action "UnRouting $ip" /sbin/ip route del $ip dev $intf
+					action "Shutting down $intf" /sbin/ip addr del $ipfull $intf
+				fi
+			fi
+		done
+
+		# Rebuild the interfaces that got taken down in the previous step, if any
+		if [ "$maskdiff" != "" ]; then
+			for md in $maskdiff ; do
+				broadcast=`echo $md | awk -F, '{ print $4 }'`
+				netmask=`echo $md | awk -F, '{ print $3 }'`
+				ip=`echo $md | awk -F, '{ print $2 }'`
+				intf=`echo $md | awk -F, '{ print $1 }'`
+				cidr=$(mask2cidr $netmask)
+				ipfull="$ip/$cidr"
+				if [ "$broadcast" == "" ]; then
+					action "Bringing up $intf" /sbin/ip addr add $ipfull dev $intf label $intf
+				else
+					action "Bringing up $intf" /sbin/ip addr add $ipfull broadcast $broadcast dev $intf label $intf
+				fi
+				action "Routing $ip" /sbin/ip route add src $ip to $ip dev $intf
+			done
+		fi
+
+		# For all the interfaces that aren't changing, make sure they are still there,
+		# and rebuild any that are not, using the same interface name.
+		# We need to rebuild these before building the new ('create') interfaces,
+		# so we can preserve the original interface names without conflicting with the names of the new interfaces
+		if [ "$masksame" != "" ]; then
+			for ms in $masksame ; do
+				broadcast=`echo $ms | awk -F, '{ print $4 }'`
+				netmask=`echo $ms | awk -F, '{ print $3 }'`
+				ip=`echo $ms | awk -F, '{ print $2 }'`
+				intf=`echo $ms | awk -F, '{ print $1 }'`
+				cidr=$(mask2cidr $netmask)
+				ipfull="$ip/$cidr"
+				found=`/sbin/ip -4 addr show dev $intf | grep -E "inet[^0-9]+$ip\\b"`
+				if [ "$found" != "" ]; then
+					echo "Address $ip/$netmask is already configured on $intf"
+				else
+					echo "Address $ip/$netmask was configured on $intf but must be reset"
+					if [ "$broadcast" == "" ]; then
+						action "Bringing up $intf" /sbin/ip addr add $ipfull dev $intf label $intf
+					else
+						action "Bringing up $intf" /sbin/ip addr add $ipfull broadcast $broadcast dev $intf label $intf
+					fi
+					action "Routing $ip" /sbin/ip route add src $ip to $ip dev $intf
+				fi
+			done
+		fi
+	fi
+
+	# Build all the interfaces that didn't previously exist.
+	if [ "$create" != "" ]; then
+		dev=0
+		cpused=`/sbin/ip -4 addr show | awk '{ print $NF";"}' | grep ':cp'`
+		for cr in $create ; do
+			broadcast=`echo $cr | awk -F, '{ print $3 }'`
+			netmask=`echo $cr | awk -F, '{ print $2 }'`
+			ip=`echo $cr | awk -F, '{ print $1 }'`
+			cidr=$(mask2cidr $netmask)
+			ipfull="$ip/$cidr"
+			# Find the next available numerical suffix, avoid naming conflicts with pre-existing interfaces
+			dev=$(($dev+1))
+			while [ ""`echo "$cpused" | grep "$ETHDEV:cp$dev;"` != "" ]; do
+				dev=$(($dev+1))
+			done
+			if [ "$broadcast" == "" ]; then
+				action "Bringing up $ETHDEV:cp$dev" /sbin/ip addr add $ipfull dev $ETHDEV label $ETHDEV:cp$dev
+			else
+				action "Bringing up $ETHDEV:cp$dev" /sbin/ip addr add $ipfull broadcast $broadcast dev $ETHDEV label $ETHDEV:cp$dev
+			fi
+			action "Routing $ip" /sbin/ip route add src $ip to $ip dev $ETHDEV:cp$dev
+		done
+	fi
+
+    /usr/local/cpanel/bin/clear_iplist_cache
+	;;
+  list)
+	ifcfg=`/sbin/ip -4 addr show | grep -E "inet[^0-9]"`
+	for ip in `cat /etc/ips | grep -E -v "\\b$mainip\\b"`; do
+		broadcast=`echo $ip | awk -F: '{ print $3 }'`
+		netmask=`echo $ip | awk -F: '{ print $2 }'`
+		ip=`echo $ip | awk -F: '{ print $1 }'`
+		if [ "$netmask" = "255.255.255.0" ]; then
+			broadcast=`echo $ip | awk -F. '{ print $1"."$2"."$3".255" }'`
+		fi
+		found=`echo "$ifcfg" | awk '{intf=$NF} /[0-9]*\.[0-9]*\.[0-9]*\.[0-9]*/ {print intf $0}' | grep -E "inet[^0-9]+$ip\\b"`
+		if [ "$found" != "" ]; then
+			intf=`echo $found | awk '{print $1}'`
+		else
+			intf='(Unavailable)'
+		fi
+		if [ "$netmask" = "" ]; then
+			echo "$intf $ip"
+		elif [ "$broadcast" = "" ]; then
+			echo "$intf $ip $netmask"
+		else
+			echo "$intf $ip $netmask $broadcast"
+		fi
+	done
+	;;
+  stop)
+	dev=1
+	ips=`cat /etc/ips  | grep -E -v "\\b$mainip\\b"`
+	addrs=`cat /etc/ips  | grep -E -v "\\b$mainip\\b" | awk -F: '{print ":"$1":"}'`
+	TAC=`which tac`
+	if [ "$TAC" == "" ]; then
+		TAC='sort -r'
+	fi
+	# Traverse the list of interfaces in descending order,
+	# so that we take down secondary interfaces before header interfaces
+	for dev in `/sbin/ip -4 addr show | grep inet  | grep "$ETHDEV:" | awk '{ print $NF }' | $TAC`; do
+		conf=`/sbin/ip -4 addr show label $dev | grep -P '\d+\.\d+\.\d+\.\d+'`
+		[ "$conf" != "" ] || continue
+		ipfull=`echo $conf | awk '{print $2}'`
+		confaddr=`echo $ipfull | awk -F/ '{print $1}'`
+		iscpanel=`echo $dev | grep ":cp"`
+		if [ "$iscpanel" != "" ]; then
+			# if this is a cpanel interface, we *must* shut it down
+			if [ "$confaddr" != "" ]; then
+				route=`/sbin/ip -4 route list | grep -E "\\b$confaddr\\b"`
+				if [ "$route" != "" ]; then
+					action "UnRouting $confaddr" /sbin/ip route del $confaddr dev $dev
+				fi
+				action "Shutting down $dev" /sbin/ip addr del $ipfull dev $dev
+			fi
+			continue
+		fi
+
+		# not a cpanel interface (maybe); if it matches an /etc/ips address, shut it down anyway
+		match=`echo $addrs | grep ":$confaddr:"`
+		[ "$match" != "" ] || continue
+
+		for ip in $ips; do
+			ipaddr=`echo $ip | awk -F: '{ print $1 }'`
+			[ "$ipaddr" == "$confaddr" ] || continue
+
+			# If the netmask is known, make sure it matches
+			netmask=`echo $ip | awk -F: '{ print $2 }'`
+			if [ "$netmask" != "" ]; then
+				match=`echo $conf | grep -E "\\b$ipaddr\\b" | grep -E "\\b$netmask\\b"`
+				[ "$match" != "" ] || continue
+			fi
+
+			# Get the cidr from the netmask
+			cidr=$(mask2cidr $netmask)
+			ipfull="$ipaddr/$cidr"
+
+			# Unroute the address and remove the interface
+			route=`/sbin/ip -4 route list | grep -E "\\b$ipaddr\\b"`
+			if [ "$route" != "" ]; then
+				action "UnRouting $ipaddr" /sbin/ip route del $ipaddr dev $dev
+			fi
+			action "Shutting down $dev" /sbin/ip addr del $ipfull dev $dev
+
+			# Remove the address from the list, to eliminate redundant checks in subsequent iterations
+			ips=`echo $ips | awk '{sub(/ *'$ip' */," "); print $0}'`
+			addrs=`echo $addrs | awk '{sub(/ *:'$ipaddr': */," "); print $0}'`
+
+			# Don't bother checking any other addresses once we've found a match
+			break
+		done
+	done
+    /usr/local/cpanel/bin/clear_iplist_cache
+	;;
+  restart)
+	$0 stop
+	$0 start
+	;;
+  reload)
+	$0 restart
+	;;
+  *)
+	echo "Usage: ipaliases {start|stop|restart|reload}"
+	exit 1
+esac
+
+exit 0

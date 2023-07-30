@@ -1,0 +1,153 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - libexec/cpanalyticsd-dormant            Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use strict;
+use warnings;
+
+use IO::Select                 ();
+use IO::Socket::UNIX           ();
+use Cpanel::Services::Hot      ();
+use Cpanel::Analytics::Config  ();
+use Cpanel::FHUtils::Blocking  ();
+use Cpanel::Sys::Setsid        ();
+use Cpanel::AccessIds::SetUids ();
+
+# Prevent failure if we went back to dormant mode with an alarm set.
+local $SIG{'ALRM'} = 'IGNORE';
+local $SIG{'CHLD'} = 'IGNORE';
+local $SIG{'HUP'}  = 'IGNORE';
+
+local $0 = 'cpanalyticsd - processor - dormant mode - accepting connections';
+
+my $MAX_FILEHANDLES_EXPECTED_TO_BE_OPEN = 1000;
+local $^F = $MAX_FILEHANDLES_EXPECTED_TO_BE_OPEN;    #prevent cloexec
+
+my $pid_file    = Cpanel::Analytics::Config::ANALYTICS_PID_FILE();
+my $socket_path = Cpanel::Analytics::Config::ANALYTICS_SOCKET();
+
+my $listenfd;
+foreach my $arg (@ARGV) {
+    if ( $arg =~ /--listen=(\S+)/ ) {
+        $listenfd = $1;
+    }
+}
+
+if ( !$listenfd ) {
+    require Cpanel::Analytics;
+    Cpanel::Analytics::prerequisites();
+}
+
+if ( !$< || !$> ) {
+    Cpanel::AccessIds::SetUids::setuids( Cpanel::Analytics::Config::ANALYTICS_USER() );
+}
+
+Cpanel::Sys::Setsid::full_daemonize() if !$listenfd;    # has to happen before the pid file setup because it forks
+
+if ( my $pid = Cpanel::Services::Hot::is_pid_file_active($pid_file) ) {
+    print "[!] cpanalyticsd is already running with PID: '$pid'\n";
+    exit 1;
+}
+
+unless ( Cpanel::Services::Hot::make_pid_file($pid_file) ) {
+    die("Unable to write $pid_file file: $!");
+}
+
+print "cpanalyticsd-dormant startup with PID '$$'\n";
+
+my $server_socket;
+if ($listenfd) {
+    $server_socket = _init_socket($listenfd);
+}
+else {
+
+    close(STDIN);
+    close(STDOUT);
+    close(STDERR);
+
+    open( STDIN, '<', '/dev/null' ) or die "Failed to open /dev/null: $!";    # Close STDIN in order to properly daemonize.
+    require Cpanel::FileUtils::Open;
+    Cpanel::FileUtils::Open::sysopen_with_real_perms( \*STDOUT, Cpanel::Analytics::Config::ERROR_LOG(), 'O_WRONLY|O_APPEND|O_CREAT', 0600 ) || die "Could not dup STDOUT: $!";    # Nothing should be writing to STDOUT
+    open( STDERR, ">&STDOUT" )                                                                                                              || die "Could not dup STDERR: $!";
+    $server_socket = _init_socket();
+}
+
+my ( $self_pipe_read_handle, $self_pipe_write_handle ) = _generate_selfpipe();
+
+my $accepted_socket;
+my $TERM_SINGLE_DIGIT_NUMBER = 4;
+local $SIG{'TERM'} = sub { syswrite( $self_pipe_write_handle, $TERM_SINGLE_DIGIT_NUMBER ); };
+local $SIG{'ALRM'} = sub { close $accepted_socket; $accepted_socket = undef; };                 # Protect against hung client
+
+while (1) {
+    my $selector = IO::Select->new( $self_pipe_read_handle, $server_socket );
+    if ( my @ready_sockets = $selector->can_read() ) {
+        foreach my $ready_socket (@ready_sockets) {
+            if ( $ready_socket == $self_pipe_read_handle ) {
+                my $signal_type;
+                if ( sysread( $self_pipe_read_handle, $signal_type, 1 ) ) {
+                    if ( $signal_type == $TERM_SINGLE_DIGIT_NUMBER ) {
+                        print "processor shutdown via SIGTERM with pid $$";
+                        unlink $pid_file if Cpanel::Services::Hot::is_pid_file_self_or_dead($pid_file);
+                        unlink $socket_path;
+                        exit(0);
+                    }
+                    else {
+                        print "Unexpected message from self pipe: $signal_type";
+                        exit(1);    # Unexpected signal
+                    }
+                }
+            }
+            else {
+                alarm 10;
+                $accepted_socket = $ready_socket->accept();
+                alarm 0;
+                if ($accepted_socket) {
+                    unlink Cpanel::Analytics::Config::ANALYTICS_PID_FILE();
+                    exec '/usr/local/cpanel/libexec/cpanalyticsd', '--start', '--listen=' . fileno($server_socket), '--accepted=' . fileno($accepted_socket);
+                    exit(1);    # protection to avoid infinite loop
+                }
+            }
+        }
+    }
+}
+
+sub _init_socket {
+    my ($listen_fd) = @_;
+
+    my $listener;
+    if ($listen_fd) {
+        $listener = IO::Socket::UNIX->new_from_fd( $listen_fd, '+<' );
+        if ( !$listener ) {
+            die( "Failed to open fd: " . $! );
+        }
+    }
+    else {
+        unlink $socket_path;
+        $listener = IO::Socket::UNIX->new(
+            Type   => Socket::SOCK_STREAM(),
+            Local  => $socket_path,
+            Listen => Socket::SOMAXCONN(),
+        ) or die("Failed to create unix socket '${socket_path}': $!");
+
+        chmod 0666, $socket_path or die "chmod: $socket_path: $!";
+    }
+
+    return $listener;
+}
+
+# For more info on self-pipes
+# http://cr.yp.to/docs/selfpipe.html
+# http://www.sitepoint.com/the-self-pipe-trick-explained/
+sub _generate_selfpipe {
+    my ( $self_pipe_read_handle, $self_pipe_write_handle );
+    pipe( $self_pipe_read_handle, $self_pipe_write_handle ) || CORE::die("Could not generate self-pipe: $!");
+
+    Cpanel::FHUtils::Blocking::set_non_blocking($self_pipe_read_handle);
+    Cpanel::FHUtils::Blocking::set_non_blocking($self_pipe_write_handle);
+
+    return ( $self_pipe_read_handle, $self_pipe_write_handle );
+}

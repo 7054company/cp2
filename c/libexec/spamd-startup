@@ -1,0 +1,172 @@
+#!/usr/local/cpanel/3rdparty/bin/perl
+
+# cpanel - libexec/spamd-startup                   Copyright 2022 cPanel, L.L.C.
+#                                                           All rights reserved.
+# copyright@cpanel.net                                         http://cpanel.net
+# This code is subject to the cPanel license. Unauthorized copying is prohibited
+
+use strict;
+
+use Cpanel::Unix::PID::Tiny   ();
+use Cpanel::Services::Dormant ();
+use Cpanel::CloseFDs          ();
+use Cpanel::Rlimit            ();
+use Cpanel::Syscall           ();
+use Cpanel::Sys::Chattr       ();
+use Cpanel::Server::Type      ();
+use Cpanel::Binaries          ();
+
+use Fcntl               ();
+use Socket              ();
+use Getopt::Param::Tiny ();
+
+our $PID_FILE;
+use constant SPAMD_LOG => q{/usr/local/cpanel/logs/spamd_error_log};
+
+=pod
+
+spamd-startup is a wrapper to start spamd in dormant mode if enabled
+
+=cut
+
+run(@ARGV) unless caller();
+
+sub run {
+    my (@argv) = @_;
+
+    my $param = Getopt::Param::Tiny->new();
+
+    if ( scalar @argv == 0 || $param->param('help') ) {
+        usage();
+    }
+    else {
+        if ( Cpanel::Server::Type::is_dnsonly() ) {
+            print STDERR "spamd service is disabled for dnsonly\n";
+            exit(1);
+        }
+        start( $param, \@argv );
+    }
+
+    exit;
+}
+
+sub usage {
+    print <<'USAGE';
+$0: start spamd daemon in dormant or normal mode
+
+Usage: $0 [options]
+
+Options:
+    --help      this help message
+    other options are preserverd to start the spamd binary
+
+USAGE
+
+    return;
+}
+
+sub start {
+    my ( $param, $args ) = @_;
+
+    my $spamd   = Cpanel::Binaries::path('spamd');
+    my $pid_obj = Cpanel::Unix::PID::Tiny->new();
+
+    -x $spamd or die "Unknown spamd binary";
+
+    $PID_FILE = $param->param('pidfile') or die "--pidfile required";
+
+    # check if process is already running
+    my $curpid = get_pid_from_pidfile($PID_FILE);
+    if ( $curpid && $pid_obj->is_pid_running($curpid) ) {
+        print STDERR "spamd is already running with PID=${PID_FILE}.\n";
+        exit(1);
+    }
+
+    Cpanel::Rlimit::set_rlimit();
+    quick_closefds();
+    openlogs();
+
+    my $dormant_mode = Cpanel::Services::Dormant->new( service => 'spamd' );
+    if ( $dormant_mode->is_enabled() ) {
+
+        # we are not really starting in dormant mode directly
+        # we let the regular spamd binary start the socket, but just ask it to go dormant faster
+        #   if no queries are detected
+        # remove the daemonize option
+        my @start_args = grep { $_ ne '-d' && $_ ne '--daemonize' } @$args;
+        push @start_args, '--start-dormant';
+        require Cpanel::FileUtils::Write;
+
+        my $dormant_start_flag = q{/var/cpanel/dormant_services/spamd/start-dormant};
+        Cpanel::FileUtils::Write::overwrite_no_exceptions( $dormant_start_flag, 1, 0600 );
+
+        if ( my $pid = fork() > 0 ) {
+
+            # giving it a few seconds (not a big deal if it fails) to switch to dormant mode
+            #   on a system with heavy load it could never go dormant, this is also fine
+            for ( 1 .. 100 ) {
+                if ( waitpid( $pid, 1 ) > 0 ) {
+                    exit $?;
+                }
+                select( undef, undef, undef, 0.1 );
+                exit(0) if !-e $dormant_start_flag;
+            }
+
+            # if it takes more than 10sec, this is not a problem, spamd is probably currently used or system has a high load
+            exit(0);
+
+        }
+        elsif ( defined $pid && $pid == 0 ) {
+            Cpanel::Syscall::syscall('setsid');
+            exec( $spamd, @start_args ) or die "Cannot execute $spamd: $!";
+        }
+        else {
+            die "Cannot fork from $0: $!";
+        }
+
+    }
+    else {
+        exec( $spamd, @$args ) or die "Cannot execute $spamd: $!";
+    }
+}
+
+sub openlogs {
+
+    close(STDIN);
+    close(STDOUT);
+    close(STDERR);
+
+    open( STDIN, '<', '/dev/null' )                                                              or warn "Cannot close STDIN: $!";
+    sysopen( STDERR, SPAMD_LOG, Fcntl::O_WRONLY() | Fcntl::O_CREAT() | Fcntl::O_APPEND(), 0600 ) or warn "Cannot redirect STDERR: $!";
+    open( STDOUT, ">&STDERR" )                                                                   or warn "Cannot redirect STDOUT: $!";
+    Cpanel::Sys::Chattr::set_attribute( \*STDERR, 'APPEND' );
+
+    return;
+}
+
+sub get_pid_from_pidfile {
+    my ($pid_file) = @_;
+    if ( -e $pid_file ) {
+        open my $fh, '<', $pid_file
+          or die "Pid file exists but could not be read: $!";
+        my $curpid = <$fh>;
+        $curpid ||= 0;
+        chomp($curpid);
+        close $fh;
+        return int $curpid;
+    }
+    return 0;
+}
+
+sub quick_closefds {
+    open( my $nul_fh, '<', '/dev/null' ) or do { warn "Cannot open /dev/null: $!"; return };
+    if ( fileno($nul_fh) > 3 ) {
+        Cpanel::CloseFDs::fast_closefds();
+    }
+    else {
+        close($nul_fh);
+    }
+    return;
+}
+
+1;
